@@ -159,6 +159,25 @@ class AdamOptimizer(optimizer.Optimizer):
         grad,
         use_locking=self._use_locking).op
 
+  def _apply_dense_hash(self, grad, var, m, v):
+    self._create_non_slot_variable(initial_value=self._beta1,
+                                   name="beta1_power",
+                                   colocate_with=var)
+    self._create_non_slot_variable(initial_value=self._beta2,
+                                   name="beta2_power",
+                                   colocate_with=var)
+
+    beta1_power, beta2_power = self._get_beta_accumulators()
+    return training_ops.apply_adam_hash(
+        var, m, v,
+        math_ops.cast(beta1_power, var.dtype.base_dtype),
+        math_ops.cast(beta2_power, var.dtype.base_dtype),
+        math_ops.cast(self._lr_t, var.dtype.base_dtype),
+        math_ops.cast(self._beta1_t, var.dtype.base_dtype),
+        math_ops.cast(self._beta2_t, var.dtype.base_dtype),
+        math_ops.cast(self._epsilon_t, var.dtype.base_dtype),
+        grad, use_locking=self._use_locking)
+
   def _resource_apply_dense(self, grad, var):
     m = self.get_slot(var, "m")
     v = self.get_slot(var, "v")

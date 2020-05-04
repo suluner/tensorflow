@@ -19,6 +19,7 @@ from __future__ import division
 from __future__ import print_function
 
 from tensorflow.python.framework import ops
+from tensorflow.python.framework import constant_op
 from tensorflow.python.ops import array_ops
 from tensorflow.python.ops import gen_array_ops
 from tensorflow.python.ops import init_ops
@@ -72,12 +73,14 @@ class AdagradOptimizer(optimizer.Optimizer):
     for v in var_list:
       dtype = v.dtype.base_dtype
       if v.get_shape().is_fully_defined():
-        init = init_ops.constant_initializer(self._initial_accumulator_value,
-                                             dtype=dtype)
+          with ops.colocate_with(v):
+              val = constant_op.constant(
+                  self._initial_accumulator_value, dtype=v.dtype, shape=v.get_shape())
+              self._get_or_make_slot(v, val, "accumulator", self._name)
       else:
         init = self._init_constant_op(v, dtype)
-      self._get_or_make_slot_with_initializer(v, init, v.get_shape(), dtype,
-                                              "accumulator", self._name)
+        self._get_or_make_slot_with_initializer(v, init, v.get_shape(), dtype,
+                                                "accumulator", self._name)
 
   def _init_constant_op(self, v, dtype):
     def init():
@@ -96,6 +99,14 @@ class AdagradOptimizer(optimizer.Optimizer):
   def _apply_dense(self, grad, var):
     acc = self.get_slot(var, "accumulator")
     return training_ops.apply_adagrad(
+        var,
+        acc,
+        math_ops.cast(self._learning_rate_tensor, var.dtype.base_dtype),
+        grad,
+        use_locking=self._use_locking)
+
+  def _apply_dense_hash(self, grad, var, acc):
+    return training_ops.apply_adagrad_hash(
         var,
         acc,
         math_ops.cast(self._learning_rate_tensor, var.dtype.base_dtype),

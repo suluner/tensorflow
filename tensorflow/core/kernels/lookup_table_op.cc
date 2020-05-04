@@ -19,6 +19,8 @@ limitations under the License.
 #include <string>
 #include <type_traits>
 #include <utility>
+#include <random>
+#include <algorithm>
 
 #include "tensorflow/core/framework/register_types.h"
 #include "tensorflow/core/framework/types.h"
@@ -26,6 +28,9 @@ limitations under the License.
 #include "tensorflow/core/kernels/initializable_lookup_table.h"
 #include "tensorflow/core/lib/gtl/inlined_vector.h"
 #include "tensorflow/core/lib/hash/hash.h"
+#include "tensorflow/core/lib/cuckoo/cuckoohash_map.hh"
+#include "tensorflow/core/util/work_sharder.h"
+
 
 namespace tensorflow {
 namespace lookup {
@@ -44,55 +49,128 @@ namespace lookup {
 //
 // table.Find(in_t, &out_t, default_t)
 //
+typedef Eigen::ThreadPoolDevice CPUDevice;
+template <typename Device, class K, class V>
+struct LaunchScalarFind;
+
+template <class K>
+struct HashFunc
+{
+	std::size_t operator()(const K &key) const 
+	{
+		return static_cast<size_t>(key);
+	}
+};
+
+
+template <class K, class V>
+struct LaunchScalarFind<CPUDevice, K, V> {
+  LaunchScalarFind(bool use_default): use_default_(use_default) {}
+
+  void launch(OpKernelContext* context, cuckoohash_map<K, V>& table, 
+  				const Tensor& key, Tensor* value, const Tensor& default_value) {
+
+	const auto key_values = key.flat<K>();
+	int64 total = key_values.size();
+
+    auto shard = [this, &table, &key, &value, &default_value](int64 begin, int64 end) {
+	  V tmp_val;
+	  const auto key_values = key.flat<K>();
+	  auto value_values = value->flat<V>();
+    std::random_device rd;
+    std::default_random_engine e(rd());
+    std::normal_distribution<float> n_{0, static_cast<float>(0.00)};
+      for (int64 i = begin; i < end; ++i) {
+
+		  if(i >= key_values.size()) break;
+		  			
+		  if(table.find(SubtleMustCopyIfIntegral(key_values(i)), tmp_val)){
+			    value_values(i) = tmp_val;
+		  } else {
+		  		if(use_default_){
+			      value_values(i) = default_value.flat<V>()(0);
+    		  }else{
+    			  value_values(i) = static_cast<V>(n_(e));
+    		  }
+			    
+		  }
+      }
+    };
+    auto worker_threads = *(context->device()->tensorflow_cpu_worker_threads());
+	int64 slices = static_cast<int64>(total / worker_threads.num_threads) + 1;
+    Shard(worker_threads.num_threads, worker_threads.workers, total, slices, shard);
+  }
+
+  bool use_default_;
+};
+
+template <typename Device, class K, class V>
+struct LaunchScalarInsert;
+
+template <class K, class V>
+struct LaunchScalarInsert<CPUDevice, K, V> {
+  LaunchScalarInsert(){}
+
+  void launch(OpKernelContext* context, cuckoohash_map<K, V>& table, 
+  				const Tensor& key, const Tensor& value) {
+
+	const auto key_values = key.flat<K>();
+	int64 total = key_values.size();
+	auto value_values = value.flat<V>();
+    auto shard = [&table, key_values, value_values](int64 begin, int64 end) {
+
+      for (int64 i = begin; i < end; ++i) {
+	  	
+		  if(i >= key_values.size()) break;
+		  table.insert_or_assign(SubtleMustCopyIfIntegral(key_values(i)), value_values(i));
+      }
+    };
+    auto worker_threads = *(context->device()->tensorflow_cpu_worker_threads());
+	int64 slices = static_cast<int64>(total / worker_threads.num_threads) + 1;
+    Shard(worker_threads.num_threads, worker_threads.workers, total, slices, shard);
+  }
+};
+
 template <class K, class V>
 class MutableHashTableOfScalars final : public LookupInterface {
  public:
-  MutableHashTableOfScalars(OpKernelContext* ctx, OpKernel* kernel) {}
+  MutableHashTableOfScalars(OpKernelContext* ctx, OpKernel* kernel) {  	
+    OP_REQUIRES_OK(ctx, GetNodeAttr(kernel->def(), "use_default", &use_default));
+  }
 
   size_t size() const override {
-    tf_shared_lock l(mu_);
     return table_.size();
   }
 
   Status Find(OpKernelContext* ctx, const Tensor& key, Tensor* value,
               const Tensor& default_value) override {
-    const V default_val = default_value.flat<V>()(0);
-    const auto key_values = key.flat<K>();
-    auto value_values = value->flat<V>();
-
-    tf_shared_lock l(mu_);
-    for (int64 i = 0; i < key_values.size(); ++i) {
-      value_values(i) = gtl::FindWithDefault(
-          table_, SubtleMustCopyIfIntegral(key_values(i)), default_val);
-    }
+              
+    LaunchScalarFind<CPUDevice, K, V> launcher(use_default);
+    launcher.launch(ctx, table_, key, value, default_value);
 
     return Status::OK();
   }
 
-  Status DoInsert(bool clear, const Tensor& keys, const Tensor& values) {
-    const auto key_values = keys.flat<K>();
-    const auto value_values = values.flat<V>();
-
-    mutex_lock l(mu_);
+  Status DoInsert(bool clear, OpKernelContext* ctx, const Tensor& keys, const Tensor& values) {
+	
     if (clear) {
       table_.clear();
     }
-    for (int64 i = 0; i < key_values.size(); ++i) {
-      gtl::InsertOrUpdate(&table_, SubtleMustCopyIfIntegral(key_values(i)),
-                          SubtleMustCopyIfIntegral(value_values(i)));
-    }
+	
+    LaunchScalarInsert<CPUDevice, K, V> launcher;
+    launcher.launch(ctx, table_, keys, values);
+
     return Status::OK();
   }
 
   Status Insert(OpKernelContext* ctx, const Tensor& keys,
                 const Tensor& values) override {
-    return DoInsert(false, keys, values);
+    return DoInsert(false, ctx, keys, values);
   }
 
   Status Remove(OpKernelContext* ctx, const Tensor& keys) override {
     const auto key_values = keys.flat<K>();
 
-    mutex_lock l(mu_);
     for (int64 i = 0; i < key_values.size(); ++i) {
       table_.erase(SubtleMustCopyIfIntegral(key_values(i)));
     }
@@ -101,12 +179,12 @@ class MutableHashTableOfScalars final : public LookupInterface {
 
   Status ImportValues(OpKernelContext* ctx, const Tensor& keys,
                       const Tensor& values) override {
-    return DoInsert(true, keys, values);
+    return DoInsert(true, ctx, keys, values);
   }
 
   Status ExportValues(OpKernelContext* ctx) override {
-    tf_shared_lock l(mu_);
-    int64 size = table_.size();
+	auto lt = table_.lock_table();
+    int64 size = lt.size();
 
     Tensor* keys;
     Tensor* values;
@@ -118,7 +196,7 @@ class MutableHashTableOfScalars final : public LookupInterface {
     auto keys_data = keys->flat<K>();
     auto values_data = values->flat<V>();
     int64 i = 0;
-    for (auto it = table_.begin(); it != table_.end(); ++it, ++i) {
+    for (auto it = lt.begin(); it != lt.end(); ++it, ++i) {
       keys_data(i) = it->first;
       values_data(i) = it->second;
     }
@@ -135,21 +213,95 @@ class MutableHashTableOfScalars final : public LookupInterface {
 
   int64 MemoryUsed() const override {
     int64 ret = 0;
-    tf_shared_lock l(mu_);
-    for (unsigned i = 0; i < table_.bucket_count(); ++i) {
-      size_t bucket_size = table_.bucket_size(i);
-      if (bucket_size == 0) {
-        ret++;
-      } else {
-        ret += bucket_size;
-      }
-    }
+    ret = (int64)table_.size();
     return sizeof(MutableHashTableOfScalars) + ret;
   }
 
  private:
-  mutable mutex mu_;
-  std::unordered_map<K, V> table_ GUARDED_BY(mu_);
+  bool use_default;
+  cuckoohash_map<K, V> table_;
+};
+
+template <typename Device, class K, class V, class J>
+struct LaunchTensorsFind;
+
+template <class K, class V, class J>
+struct LaunchTensorsFind<CPUDevice, K, V, J> {
+  LaunchTensorsFind(bool use_default, int64 value_dim)
+  	: use_default_(use_default), value_dim_(value_dim) {}
+
+  void launch(OpKernelContext* context, cuckoohash_map<K, J>& table, 
+  				const Tensor& key, Tensor* value, const Tensor& default_value) {
+
+	const auto key_values = key.flat<K>();
+	int64 total = key_values.size();
+	
+	const auto default_flat = default_value.flat<V>();
+	auto value_values = value->flat_inner_dims<V, 2>();   
+
+    auto shard = [this, &table, key_values, &value_values, default_flat](int64 begin, int64 end) {
+    std::random_device rd;
+    std::default_random_engine e(rd());
+    std::normal_distribution<float> n_(0, 0.01); 
+    for (int64 i = begin; i < end; ++i) {
+
+		if(i >= key_values.size()) break;
+		J value_vec;
+		if(table.find(key_values(i), value_vec)){
+		  for (int64 j = 0; j < value_dim_; j++) {
+			value_values(i, j) = value_vec.at(j);
+		  }
+		} else {
+		  for (int64 j = 0; j < value_dim_; j++) {				
+		    if(use_default_){
+			    value_values(i, j) = default_flat(j);
+  			}else{
+  			  value_values(i, j) = static_cast<V>(n_(e));
+  			}
+		  }		 
+		}
+      }
+    };
+    auto worker_threads = *(context->device()->tensorflow_cpu_worker_threads());
+	int64 slices = static_cast<int64>(total / worker_threads.num_threads) + 1;
+    Shard(worker_threads.num_threads, worker_threads.workers, total, slices, shard);
+  }
+
+  bool use_default_;
+  int64 value_dim_;
+};
+
+template <typename Device, class K, class V, class J>
+struct LaunchTensorsInsert;
+
+template <class K, class V, class J>
+struct LaunchTensorsInsert<CPUDevice, K, V, J> {
+  LaunchTensorsInsert(int64 value_dim):      value_dim_(value_dim){}
+
+  void launch(OpKernelContext* context, cuckoohash_map<K, J>& table, 
+  				const Tensor& keys, const Tensor& values) {
+  				
+	const auto key_values = keys.flat<K>();
+	int64 total = key_values.size();
+	const auto value_values = values.flat_inner_dims<V, 2>();
+
+    auto shard = [this, &table, key_values, value_values](int64 begin, int64 end) {
+      for (int64 i = begin; i < end; ++i) {
+	  	if(i >= key_values.size()) break;     
+	    J value_vec;
+        for (int64 j = 0; j < value_dim_; j++) {
+          V value = value_values(i, j);
+          value_vec.push_back(value);
+        }
+	    table.insert_or_assign(key_values(i), value_vec);
+      }
+    };
+    auto worker_threads = *(context->device()->tensorflow_cpu_worker_threads());
+	int64 slices = static_cast<int64>(total / worker_threads.num_threads) + 1;
+    Shard(worker_threads.num_threads, worker_threads.workers, total, slices, shard);
+  }
+
+  int64 value_dim_;
 };
 
 // Lookup table that wraps an unordered_map. Behaves identical to
@@ -158,6 +310,9 @@ template <class K, class V>
 class MutableHashTableOfTensors final : public LookupInterface {
  public:
   MutableHashTableOfTensors(OpKernelContext* ctx, OpKernel* kernel) {
+  	
+    OP_REQUIRES_OK(ctx,
+                   GetNodeAttr(kernel->def(), "use_default", &use_default));
     OP_REQUIRES_OK(ctx,
                    GetNodeAttr(kernel->def(), "value_shape", &value_shape_));
     OP_REQUIRES(
@@ -167,65 +322,42 @@ class MutableHashTableOfTensors final : public LookupInterface {
   }
 
   size_t size() const override {
-    tf_shared_lock l(mu_);
     return table_.size();
   }
 
   Status Find(OpKernelContext* ctx, const Tensor& key, Tensor* value,
               const Tensor& default_value) override {
-    const auto default_flat = default_value.flat<V>();
-    const auto key_values = key.flat<K>();
-    auto value_values = value->flat_inner_dims<V, 2>();
-    int64 value_dim = value_shape_.dim_size(0);
 
-    tf_shared_lock l(mu_);
-    for (int64 i = 0; i < key_values.size(); ++i) {
-      ValueArray* value_vec =
-          gtl::FindOrNull(table_, SubtleMustCopyIfIntegral(key_values(i)));
-      if (value_vec != nullptr) {
-        for (int64 j = 0; j < value_dim; j++) {
-          value_values(i, j) = value_vec->at(j);
-        }
-      } else {
-        for (int64 j = 0; j < value_dim; j++) {
-          value_values(i, j) = default_flat(j);
-        }
-      }
-    }
+	int64 value_dim = value_shape_.dim_size(0);
+	
+    LaunchTensorsFind<CPUDevice, K, V, ValueArray> launcher(use_default, value_dim);
+    launcher.launch(ctx, table_, key, value, default_value);
 
     return Status::OK();
   }
 
-  Status DoInsert(bool clear, const Tensor& keys, const Tensor& values) {
-    const auto key_values = keys.flat<K>();
-    const auto value_values = values.flat_inner_dims<V, 2>();
-    int64 value_dim = value_shape_.dim_size(0);
+  Status DoInsert(bool clear, OpKernelContext* ctx, const Tensor& keys, const Tensor& values) {
 
-    mutex_lock l(mu_);
+    int64 value_dim = value_shape_.dim_size(0);
+	
     if (clear) {
       table_.clear();
     }
-    for (int64 i = 0; i < key_values.size(); ++i) {
-      ValueArray value_vec;
-      for (int64 j = 0; j < value_dim; j++) {
-        V value = value_values(i, j);
-        value_vec.push_back(value);
-      }
-      gtl::InsertOrUpdate(&table_, SubtleMustCopyIfIntegral(key_values(i)),
-                          value_vec);
-    }
+	
+    LaunchTensorsInsert<CPUDevice, K, V, ValueArray> launcher(value_dim);
+    launcher.launch(ctx, table_, keys, values);
+
     return Status::OK();
   }
 
   Status Insert(OpKernelContext* ctx, const Tensor& keys,
                 const Tensor& values) override {
-    return DoInsert(false, keys, values);
+    return DoInsert(false, ctx, keys, values);
   }
 
   Status Remove(OpKernelContext* ctx, const Tensor& keys) override {
     const auto key_values = keys.flat<K>();
 
-    mutex_lock l(mu_);
     for (int64 i = 0; i < key_values.size(); ++i) {
       table_.erase(SubtleMustCopyIfIntegral(key_values(i)));
     }
@@ -234,12 +366,12 @@ class MutableHashTableOfTensors final : public LookupInterface {
 
   Status ImportValues(OpKernelContext* ctx, const Tensor& keys,
                       const Tensor& values) override {
-    return DoInsert(true, keys, values);
+    return DoInsert(true, ctx, keys, values);
   }
 
   Status ExportValues(OpKernelContext* ctx) override {
-    tf_shared_lock l(mu_);
-    int64 size = table_.size();
+	auto lt = table_.lock_table();
+    int64 size = lt.size();
     int64 value_dim = value_shape_.dim_size(0);
 
     Tensor* keys;
@@ -252,7 +384,7 @@ class MutableHashTableOfTensors final : public LookupInterface {
     auto keys_data = keys->flat<K>();
     auto values_data = values->matrix<V>();
     int64 i = 0;
-    for (auto it = table_.begin(); it != table_.end(); ++it, ++i) {
+    for (auto it = lt.begin(); it != lt.end(); ++it, ++i) {
       K key = it->first;
       ValueArray value = it->second;
       keys_data(i) = key;
@@ -273,23 +405,15 @@ class MutableHashTableOfTensors final : public LookupInterface {
 
   int64 MemoryUsed() const override {
     int64 ret = 0;
-    tf_shared_lock l(mu_);
-    for (unsigned i = 0; i < table_.bucket_count(); ++i) {
-      size_t bucket_size = table_.bucket_size(i);
-      if (bucket_size == 0) {
-        ret++;
-      } else {
-        ret += bucket_size;
-      }
-    }
+	ret = (int64)table_.size();
     return sizeof(MutableHashTableOfTensors) + ret;
   }
 
  private:
   TensorShape value_shape_;
-  mutable mutex mu_;
+  bool use_default;
   typedef gtl::InlinedVector<V, 4> ValueArray;
-  std::unordered_map<K, ValueArray> table_ GUARDED_BY(mu_);
+  cuckoohash_map<K, ValueArray> table_;
 };
 
 namespace {

@@ -271,7 +271,21 @@ REGISTER_OP("ApplyAdagrad")
     .SetShapeFn([](InferenceContext* c) {
       return ApplyAdagradShapeFn(c, false /* sparse */);
     });
-
+	
+REGISTER_OP("ApplyAdagradHash")
+    .Input("var: T")
+    .Input("accum: T")
+    .Input("lr: T")
+    .Input("grad: T")
+    .Output("out: T")
+    .Output("new_accum: T")
+    .Attr("T: numbertype")
+    .Attr("use_locking: bool = false")
+    .Attr("update_slots: bool = true")
+    .SetShapeFn([](InferenceContext* c) {
+      return ApplyAdagradShapeFn(c, false /* sparse */);
+    });
+	
 REGISTER_OP("ResourceApplyAdagrad")
     .Input("var: resource")
     .Input("accum: resource")
@@ -549,15 +563,17 @@ static Status ApplyFtrlShapeFn(InferenceContext* c, bool sparse) {
 }
 
 REGISTER_OP("ApplyFtrl")
-    .Input("var: Ref(T)")
-    .Input("accum: Ref(T)")
-    .Input("linear: Ref(T)")
+    .Input("var: T")
+    .Input("accum: T")
+    .Input("linear: T")
     .Input("grad: T")
     .Input("lr: T")
     .Input("l1: T")
     .Input("l2: T")
     .Input("lr_power: T")
-    .Output("out: Ref(T)")
+    .Output("out: T")
+    .Output("new_accum: T")
+    .Output("new_linear: T")
     .Attr("T: numbertype")
     .Attr("use_locking: bool = false")
     .SetShapeFn([](InferenceContext* c) {
@@ -565,9 +581,9 @@ REGISTER_OP("ApplyFtrl")
     });
 
 REGISTER_OP("SparseApplyFtrl")
-    .Input("var: Ref(T)")
-    .Input("accum: Ref(T)")
-    .Input("linear: Ref(T)")
+    .Input("var: T")
+    .Input("accum: T")
+    .Input("linear: T")
     .Input("grad: T")
     .Input("indices: Tindices")
     .Input("lr: T")
@@ -631,6 +647,25 @@ REGISTER_OP("ApplyFtrlV2")
       return ApplyFtrlShapeFn(c, false /* sparse */);
     });
 
+REGISTER_OP("ApplyFtrlHashV2")
+    .Input("var: T")
+    .Input("accum: T")
+    .Input("linear: T")
+    .Input("grad: T")
+    .Input("lr: T")
+    .Input("l1: T")
+    .Input("l2: T")
+    .Input("l2_shrinkage: T")
+    .Input("lr_power: T")
+    .Output("out: T")
+    .Output("new_accum: T")
+    .Output("new_linear: T")
+    .Attr("T: numbertype")
+    .Attr("use_locking: bool = false")
+    .SetShapeFn([](InferenceContext* c) {
+      return ApplyFtrlShapeFn(c, false /* sparse */);
+    });
+	
 REGISTER_OP("SparseApplyFtrlV2")
     .Input("var: Ref(T)")
     .Input("accum: Ref(T)")
@@ -713,6 +748,21 @@ REGISTER_OP("ApplyMomentum")
       return ApplyMomentumShapeFn(c, false /* sparse */);
     });
 
+REGISTER_OP("ApplyMomentumHash")
+    .Input("var: T")
+    .Input("accum: T")
+    .Input("lr: T")
+    .Input("grad: T")
+    .Input("momentum: T")
+    .Output("out: T")
+    .Output("new_accum: T")
+    .Attr("T: numbertype")
+    .Attr("use_locking: bool = false")
+    .Attr("use_nesterov: bool = false")
+    .SetShapeFn([](InferenceContext* c) {
+      return ApplyMomentumShapeFn(c, false /* sparse */);
+    });
+	
 REGISTER_OP("SparseApplyMomentum")
     .Input("var: Ref(T)")
     .Input("accum: Ref(T)")
@@ -822,6 +872,27 @@ REGISTER_OP("ApplyAdam")
     .SetShapeFn([](InferenceContext* c) {
       return ApplyAdamShapeFn(c, false /* sparse */);
     });
+
+  REGISTER_OP("ApplyAdamHash")
+      .Input("var: T")
+      .Input("m: T")
+      .Input("v: T")
+      .Input("beta1_power: T")
+      .Input("beta2_power: T")
+      .Input("lr: T")
+      .Input("beta1: T")
+      .Input("beta2: T")
+      .Input("epsilon: T")
+      .Input("grad: T")
+      .Output("out: T")
+      .Output("new_m: T")
+      .Output("new_v: T")
+      .Attr("T: numbertype")
+      .Attr("use_locking: bool = false")
+      .Attr("use_nesterov: bool = false")
+      .SetShapeFn([](InferenceContext* c) {
+        return ApplyAdamShapeFn(c, false /* sparse */);
+      });      
 
 REGISTER_OP("ResourceApplyAdam")
     .Input("var: resource")

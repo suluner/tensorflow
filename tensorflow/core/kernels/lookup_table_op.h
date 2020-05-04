@@ -41,9 +41,6 @@ class LookupTableOp : public OpKernel {
   // ctx is not owned by this class.
   explicit LookupTableOp(OpKernelConstruction* ctx)
       : OpKernel(ctx), table_handle_set_(false) {
-    OP_REQUIRES_OK(ctx, ctx->allocate_persistent(tensorflow::DT_STRING,
-                                                 tensorflow::TensorShape({2}),
-                                                 &table_handle_, nullptr));
     OP_REQUIRES_OK(
         ctx, ctx->GetAttr("use_node_name_sharing", &use_node_name_sharing_));
   }
@@ -53,25 +50,29 @@ class LookupTableOp : public OpKernel {
     mutex_lock l(mu_);
 
     if (!table_handle_set_) {
+      AllocatorAttributes attr;
+      attr.set_gpu_compatible(true);
+      attr.set_on_host(true);
+      OP_REQUIRES_OK(ctx, ctx->allocate_persistent(tensorflow::DT_STRING,
+                                                   tensorflow::TensorShape({2}),
+                                                   &table_handle_, nullptr, attr));
       OP_REQUIRES_OK(ctx, cinfo_.Init(ctx->resource_manager(), def(),
                                       use_node_name_sharing_));
     }
 
-    auto creator =
-        [ctx, this](lookup::LookupInterface** ret)
-            EXCLUSIVE_LOCKS_REQUIRED(mu_) {
-              lookup::LookupInterface* container = new Container(ctx, this);
-              if (!ctx->status().ok()) {
-                container->Unref();
-                return ctx->status();
-              }
-              if (ctx->track_allocations()) {
-                ctx->record_persistent_memory_allocation(
-                    container->MemoryUsed() + table_handle_.AllocatedBytes());
-              }
-              *ret = container;
-              return Status::OK();
-            };
+    auto creator = [ctx, this](lookup::LookupInterface** ret) {
+      lookup::LookupInterface* container = new Container(ctx, this);
+      if (!ctx->status().ok()) {
+        container->Unref();
+        return ctx->status();
+      }
+      if (ctx->track_allocations()) {
+        ctx->record_persistent_memory_allocation(
+            container->MemoryUsed() + table_handle_.AllocatedBytes());
+      }
+      *ret = container;
+      return Status::OK();
+    };
 
     lookup::LookupInterface* table = nullptr;
     OP_REQUIRES_OK(ctx,

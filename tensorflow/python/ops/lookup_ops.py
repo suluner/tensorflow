@@ -1612,7 +1612,10 @@ class MutableHashTable(LookupInterface):
                key_dtype,
                value_dtype,
                default_value,
+               shared_name=None,
                name="MutableHashTable",
+               use_default=True,
+               max_size=50000000,
                checkpoint=True):
     """Creates an empty `MutableHashTable` object.
 
@@ -1641,7 +1644,8 @@ class MutableHashTable(LookupInterface):
     self._key_dtype = key_dtype
     self._value_dtype = value_dtype
     self._name = name
-
+    self._use_default = use_default
+    self._max_size = max_size
     self._shared_name = None
     if context.executing_eagerly():
       # TODO(allenl): This will leak memory due to kernel caching by the
@@ -1669,6 +1673,8 @@ class MutableHashTable(LookupInterface):
           use_node_name_sharing=use_node_name_sharing,
           key_dtype=self._key_dtype,
           value_dtype=self._value_dtype,
+          use_default=self._use_default,
+		  max_size=self._max_size,
           name=self._name)
     else:
       table_ref = gen_lookup_ops.mutable_hash_table_of_tensors_v2(
@@ -1677,6 +1683,8 @@ class MutableHashTable(LookupInterface):
           key_dtype=self._key_dtype,
           value_dtype=self._value_dtype,
           value_shape=self._default_value.get_shape(),
+		  use_default=self._use_default,
+		  max_size=self._max_size,
           name=self._name)
 
     if context.executing_eagerly():

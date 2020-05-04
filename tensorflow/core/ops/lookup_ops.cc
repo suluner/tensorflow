@@ -360,6 +360,8 @@ REGISTER_OP("MutableHashTable")
     .Attr("use_node_name_sharing: bool = false")
     .Attr("key_dtype: type")
     .Attr("value_dtype: type")
+    .Attr("use_default: bool = true")
+    .Attr("max_size: int = 10000000")
     .SetIsStateful()
     .SetShapeFn(TwoElementOutput);
 
@@ -369,7 +371,9 @@ REGISTER_OP("MutableHashTableV2")
     .Attr("shared_name: string = ''")
     .Attr("use_node_name_sharing: bool = false")
     .Attr("key_dtype: type")
-    .Attr("value_dtype: type")
+    .Attr("value_dtype: type")    
+    .Attr("use_default: bool = true")
+    .Attr("max_size: int = 10000000")
     .SetIsStateful()
     .SetShapeFn([](InferenceContext* c) {
       return MutableHashTableShape(c, /*key=*/c->Scalar(),
@@ -384,6 +388,8 @@ REGISTER_OP("MutableHashTableOfTensors")
     .Attr("key_dtype: type")
     .Attr("value_dtype: type")
     .Attr("value_shape: shape = {}")
+    .Attr("use_default: bool = true")
+    .Attr("max_size: int = 10000000")
     .SetIsStateful()
     .SetShapeFn(TwoElementOutput);
 
@@ -395,6 +401,8 @@ REGISTER_OP("MutableHashTableOfTensorsV2")
     .Attr("key_dtype: type")
     .Attr("value_dtype: type")
     .Attr("value_shape: shape = {}")
+    .Attr("use_default: bool = true")
+    .Attr("max_size: int = 10000000")
     .SetIsStateful()
     .SetShapeFn([](InferenceContext* c) {
       PartialTensorShape value_p;

@@ -1238,10 +1238,91 @@ class ApplyAdagradOp : public OpKernel {
   bool update_slots_;
 };
 
+
+template <typename Device, typename T>
+class ApplyAdagradHashOp : public OpKernel {
+ public:
+  explicit ApplyAdagradHashOp(OpKernelConstruction* ctx) : OpKernel(ctx) {
+    OP_REQUIRES_OK(ctx, ctx->GetAttr("use_locking", &use_exclusive_lock_));
+    OP_REQUIRES_OK(ctx, ctx->GetAttr("update_slots", &update_slots_));
+    #if GOOGLE_CUDA
+    cudaStreamCreate(&stream);
+    #endif
+  }
+  #if GOOGLE_CUDA
+  ~ApplyAdagradHashOp(){
+    cudaStreamDestroy(stream);
+  }
+  #endif
+
+  void Compute(OpKernelContext* ctx) override {
+
+    Tensor* new_var;
+    Tensor* new_accum;
+
+	const Tensor& var = ctx->input(0);
+	const Tensor& accum = ctx->input(1);
+
+    const Tensor& lr = ctx->input(2);
+	const int64 num_elements = var.NumElements();
+	
+    OP_REQUIRES(ctx, IsLegacyScalar(lr.shape()),
+                errors::InvalidArgument("lr is not a scalar: ",
+                                        lr.shape().DebugString()));
+    const Tensor& grad = ctx->input(3);
+    OP_REQUIRES(
+        ctx, var.shape().IsSameSize(accum.shape()),
+        errors::InvalidArgument("var and accum do not have the same shape",
+                                var.shape().DebugString(), " ",
+                                accum.shape().DebugString()));
+    OP_REQUIRES(
+        ctx, var.shape().IsSameSize(grad.shape()),
+        errors::InvalidArgument("var and grad do not have the same shape",
+                                var.shape().DebugString(), " ",
+                                grad.shape().DebugString()));
+    
+    #if GOOGLE_CUDA
+    if(IsGPUDevice<Device>()){
+      auto* stream = ctx->op_device_context()->stream();
+      
+      AllocatorAttributes alloc_attrs;
+      alloc_attrs.set_gpu_compatible(true);
+      alloc_attrs.set_nic_compatible(true);
+      alloc_attrs.set_on_host(false);
+  	  OP_REQUIRES_OK(ctx, ctx->allocate_output(0, var.shape(), &new_var, alloc_attrs));
+  	  OP_REQUIRES_OK(ctx, ctx->allocate_output(1, accum.shape(), &new_accum, alloc_attrs));
+      cudaMemcpy((void*)new_var->flat<T>().data(), (void*)var.flat<T>().data(), num_elements * sizeof(T), cudaMemcpyDefault);
+      cudaMemcpy((void*)new_accum->flat<T>().data(), (void*)accum.flat<T>().data(), num_elements * sizeof(T), cudaMemcpyDefault);    
+    }else
+    #endif
+    {
+  	  OP_REQUIRES_OK(ctx, ctx->allocate_output(0, var.shape(), &new_var));
+  	  OP_REQUIRES_OK(ctx, ctx->allocate_output(1, accum.shape(), &new_accum));
+      std::copy_n(var.flat<T>().data(), num_elements , new_var->flat<T>().data());
+  	  std::copy_n(accum.flat<T>().data(), num_elements , new_accum->flat<T>().data());
+    }
+    const Device& device = ctx->template eigen_device<Device>();
+    functor::ApplyAdagrad<Device, T>()(device, new_var->flat<T>(), new_accum->flat<T>(),
+                                       lr.scalar<T>(), grad.flat<T>(),
+                                       update_slots_);
+
+  }
+
+ private:
+  bool use_exclusive_lock_;
+  bool update_slots_;
+  #if GOOGLE_CUDA
+  cudaStream_t stream;
+  #endif
+};
+
 #define REGISTER_KERNELS(D, T)                                        \
   REGISTER_KERNEL_BUILDER(                                            \
       Name("ApplyAdagrad").Device(DEVICE_##D).TypeConstraint<T>("T"), \
       ApplyAdagradOp<D##Device, T>);                                  \
+  REGISTER_KERNEL_BUILDER(                                            \
+      Name("ApplyAdagradHash").Device(DEVICE_##D).TypeConstraint<T>("T"), \
+      ApplyAdagradHashOp<D##Device, T>);                                  \
   REGISTER_KERNEL_BUILDER(Name("ResourceApplyAdagrad")                \
                               .HostMemory("var")                      \
                               .HostMemory("accum")                    \
@@ -2401,10 +2482,114 @@ class ApplyFtrlOp : public OpKernel {
   bool use_exclusive_lock_;
 };
 
+template <typename Device, typename T, bool has_l2_shrinkage>
+class ApplyFtrlHashOp : public OpKernel {
+ public:
+  explicit ApplyFtrlOp(OpKernelConstruction* ctx) : OpKernel(ctx) {
+    OP_REQUIRES_OK(ctx, ctx->GetAttr("use_locking", &use_exclusive_lock_));
+  }
+
+  void Compute(OpKernelContext* ctx) override {
+	  
+    Tensor* new_var;
+    Tensor* new_accum;
+    Tensor* new_linear;
+
+	const Tensor& var = ctx->input(0);
+	const Tensor& accum = ctx->input(1);
+	const Tensor& linear = ctx->input(2);
+
+    const Tensor& grad = ctx->input(3);
+	const int64 num_elements = var.NumElements();
+	
+    OP_REQUIRES(
+        ctx, var.shape().IsSameSize(accum.shape()),
+        errors::InvalidArgument("var and accum do not have the same shape",
+                                var.shape().DebugString(), " ",
+                                accum.shape().DebugString()));
+    OP_REQUIRES(
+        ctx, var.shape().IsSameSize(linear.shape()),
+        errors::InvalidArgument("var and linear do not have the same shape",
+                                var.shape().DebugString(), " ",
+                                linear.shape().DebugString()));
+    OP_REQUIRES(
+        ctx, var.shape().IsSameSize(grad.shape()),
+        errors::InvalidArgument("var and grad do not have the same shape",
+                                var.shape().DebugString(), " ",
+                                grad.shape().DebugString()));
+
+    const Tensor& lr = ctx->input(4);
+    OP_REQUIRES(ctx,
+                TensorShapeUtils::IsScalar(lr.shape()) &&
+                    lr.scalar<T>()() > static_cast<T>(0),
+                errors::InvalidArgument("lr is not a positive scalar: ",
+                                        lr.shape().DebugString()));
+    const Tensor& l1 = ctx->input(5);
+    OP_REQUIRES(ctx,
+                TensorShapeUtils::IsScalar(l1.shape()) &&
+                    l1.scalar<T>()() >= static_cast<T>(0),
+                errors::InvalidArgument("l1 regularization strength is not a "
+                                        "non-negative scalar: ",
+                                        l1.shape().DebugString()));
+    const Tensor& l2 = ctx->input(6);
+    OP_REQUIRES(ctx,
+                TensorShapeUtils::IsScalar(l2.shape()) &&
+                    l2.scalar<T>()() >= static_cast<T>(0),
+                errors::InvalidArgument("l2 regularization strength is not a "
+                                        "non-negative scalar: ",
+                                        l2.shape().DebugString()));
+    const int lr_power_index = has_l2_shrinkage ? 8 : 7;
+    const Tensor& lr_power = ctx->input(lr_power_index);
+    OP_REQUIRES(ctx,
+                TensorShapeUtils::IsScalar(lr_power.shape()) &&
+                    lr_power.scalar<T>()() <= static_cast<T>(0),
+                errors::InvalidArgument("lr_power is not a"
+                                        " non-positive scalar: ",
+                                        lr_power.shape().DebugString()));
+	
+
+  OP_REQUIRES_OK(ctx, ctx->allocate_output(0, var.shape(), &new_var));
+	OP_REQUIRES_OK(ctx, ctx->allocate_output(1, accum.shape(), &new_accum));
+	OP_REQUIRES_OK(ctx, ctx->allocate_output(2, linear.shape(), &new_linear));
+
+	std::copy_n(var.flat<T>().data(), num_elements , new_var->flat<T>().data());
+	std::copy_n(accum.flat<T>().data(), num_elements , new_accum->flat<T>().data());
+	std::copy_n(linear.flat<T>().data(), num_elements , new_linear->flat<T>().data());
+
+    const Device& device = ctx->template eigen_device<Device>();
+    if (has_l2_shrinkage) {
+      const Tensor& l2_shrinkage = ctx->input(7);
+      OP_REQUIRES(
+          ctx,
+          TensorShapeUtils::IsScalar(l2_shrinkage.shape()) &&
+              l2_shrinkage.scalar<T>()() >= static_cast<T>(0),
+          errors::InvalidArgument("l2 shrinkage regularization strength "
+                                  "is not a non-negative scalar: ",
+                                  l2_shrinkage.shape().DebugString()));
+      functor::ApplyFtrlV2<Device, T>()(
+          device, new_var->flat<T>(), new_accum->flat<T>(), new_linear->flat<T>(),
+          grad.flat<T>(), lr.scalar<T>(), l1.scalar<T>(), l2.scalar<T>(),
+          l2_shrinkage.scalar<T>(), lr_power.scalar<T>());
+    } else {
+      functor::ApplyFtrl<Device, T>()(device, new_var->flat<T>(), new_accum->flat<T>(),
+                                      new_linear->flat<T>(), grad.flat<T>(),
+                                      lr.scalar<T>(), l1.scalar<T>(),
+                                      l2.scalar<T>(), lr_power.scalar<T>());
+    }
+
+  }
+
+ private:
+  bool use_exclusive_lock_;
+};
+
 #define REGISTER_KERNELS(D, T)                                     \
   REGISTER_KERNEL_BUILDER(                                         \
       Name("ApplyFtrl").Device(DEVICE_##D).TypeConstraint<T>("T"), \
       ApplyFtrlOp<D##Device, T, /*has_l2_shrinkage=*/false>);      \
+  REGISTER_KERNEL_BUILDER(                                         \
+      Name("ApplyFtrl").Device(DEVICE_##D).TypeConstraint<T>("T"), \
+      ApplyFtrlHashOp<D##Device, T, /*has_l2_shrinkage=*/false>);      \
   REGISTER_KERNEL_BUILDER(                                         \
       Name("ResourceApplyFtrl")                                    \
           .HostMemory("var")                                       \
@@ -2780,10 +2965,97 @@ class ApplyMomentumOp : public OpKernel {
   bool use_nesterov_;
 };
 
+template <typename Device, typename T>
+class ApplyMomentumHashOp : public OpKernel {
+ public:
+  explicit ApplyMomentumHashOp(OpKernelConstruction* ctx) : OpKernel(ctx) {
+    OP_REQUIRES_OK(ctx, ctx->GetAttr("use_locking", &use_exclusive_lock_));
+    OP_REQUIRES_OK(ctx, ctx->GetAttr("use_nesterov", &use_nesterov_));
+    #if GOOGLE_CUDA
+    cudaStreamCreate(&stream);
+    #endif
+  }
+  
+#if GOOGLE_CUDA
+    ~ApplyMomentumHashOp(){
+      cudaStreamDestroy(stream);
+    }
+#endif
+
+  void Compute(OpKernelContext* ctx) override {
+    
+    Tensor* new_var;
+    Tensor* new_accum;
+
+    const Tensor& var = ctx->input(0);
+    const Tensor& accum = ctx->input(1);
+    
+    const Tensor& lr = ctx->input(2);
+    OP_REQUIRES(ctx, TensorShapeUtils::IsScalar(lr.shape()),
+                errors::InvalidArgument("lr is not a scalar: ",
+                                        lr.shape().DebugString()));
+    const Tensor& grad = ctx->input(3);
+    const int64 num_elements = var.NumElements();
+
+    OP_REQUIRES(
+        ctx, var.shape().IsSameSize(accum.shape()),
+        errors::InvalidArgument("var and accum do not have the same shape",
+                                var.shape().DebugString(), " ",
+                                accum.shape().DebugString()));
+    OP_REQUIRES(
+        ctx, var.shape().IsSameSize(grad.shape()),
+        errors::InvalidArgument("var and grad do not have the same shape",
+                                var.shape().DebugString(), " ",
+                                grad.shape().DebugString()));
+
+    const Tensor& momentum = ctx->input(4);
+    OP_REQUIRES(ctx, TensorShapeUtils::IsScalar(momentum.shape()),
+                errors::InvalidArgument("momentum is not a scalar: ",
+                                        momentum.shape().DebugString()));
+
+    #if GOOGLE_CUDA
+    if (IsGPUDevice<Device>()){
+      auto* stream = ctx->op_device_context()->stream();
+      
+      AllocatorAttributes alloc_attrs;
+      alloc_attrs.set_gpu_compatible(true);
+      alloc_attrs.set_nic_compatible(true);
+      alloc_attrs.set_on_host(false);
+  	  OP_REQUIRES_OK(ctx, ctx->allocate_output(0, var.shape(), &new_var, alloc_attrs));
+  	  OP_REQUIRES_OK(ctx, ctx->allocate_output(1, accum.shape(), &new_accum, alloc_attrs));
+      cudaMemcpy((void*)new_var->flat<T>().data(), (void*)var.flat<T>().data(), num_elements * sizeof(T), cudaMemcpyDefault);
+      cudaMemcpy((void*)new_accum->flat<T>().data(), (void*)accum.flat<T>().data(), num_elements * sizeof(T), cudaMemcpyDefault);
+      //cudaStreamSynchronize(stream);   
+    }else
+    #endif
+    {
+  	  OP_REQUIRES_OK(ctx, ctx->allocate_output(0, var.shape(), &new_var));
+  	  OP_REQUIRES_OK(ctx, ctx->allocate_output(1, accum.shape(), &new_accum));
+      std::copy_n(var.flat<T>().data(), num_elements , new_var->flat<T>().data());
+  	  std::copy_n(accum.flat<T>().data(), num_elements , new_accum->flat<T>().data());
+    }
+    
+    const Device& device = ctx->template eigen_device<Device>();
+    functor::ApplyMomentum<Device, T>()(device, new_var->flat<T>(), new_accum->flat<T>(),
+                                        lr.scalar<T>(), grad.flat<T>(),
+                                        momentum.scalar<T>(), use_nesterov_);
+  }
+
+ private:
+  bool use_exclusive_lock_;
+  bool use_nesterov_;
+  #if GOOGLE_CUDA
+  cudaStream_t stream;
+  #endif
+};
+
 #define REGISTER_KERNELS(D, T)                                         \
   REGISTER_KERNEL_BUILDER(                                             \
       Name("ApplyMomentum").Device(DEVICE_##D).TypeConstraint<T>("T"), \
       ApplyMomentumOp<D##Device, T>);                                  \
+  REGISTER_KERNEL_BUILDER(                                             \
+      Name("ApplyMomentumHash").Device(DEVICE_##D).TypeConstraint<T>("T"), \
+      ApplyMomentumHashOp<D##Device, T>);                                  \
   REGISTER_KERNEL_BUILDER(Name("ResourceApplyMomentum")                \
                               .Device(DEVICE_##D)                      \
                               .HostMemory("var")                       \
@@ -3245,6 +3517,119 @@ class ApplyAdamOp : public OpKernel {
   bool use_nesterov_;
 };
 
+
+template <typename Device, typename T>
+class ApplyAdamHashOp : public OpKernel {
+ public:
+  explicit ApplyAdamHashOp(OpKernelConstruction* ctx) : OpKernel(ctx) {
+    OP_REQUIRES_OK(ctx, ctx->GetAttr("use_locking", &use_exclusive_lock_));
+    OP_REQUIRES_OK(ctx, ctx->GetAttr("use_nesterov", &use_nesterov_));
+    #if GOOGLE_CUDA
+    cudaStreamCreate(&stream);
+    #endif
+  }
+
+#if GOOGLE_CUDA
+  ~ApplyAdamHashOp(){
+    cudaStreamDestroy(stream);
+  }
+#endif
+
+  void Compute(OpKernelContext* ctx) override {
+    Tensor* new_var;
+    Tensor* new_m;
+    Tensor* new_v;
+    
+    const Tensor& var = ctx->input(0);
+    const Tensor& m = ctx->input(1);
+    const Tensor& v = ctx->input(2);
+    const int64 num_elements = var.NumElements();
+
+    const Tensor& beta1_power = ctx->input(3);
+    const Tensor& beta2_power = ctx->input(4);
+    const Tensor& lr = ctx->input(5);
+    const Tensor& beta1 = ctx->input(6);
+    const Tensor& beta2 = ctx->input(7);
+    const Tensor& epsilon = ctx->input(8);
+
+    OP_REQUIRES(ctx, TensorShapeUtils::IsScalar(beta1_power.shape()),
+                errors::InvalidArgument("beta1_power is not a scalar: ",
+                                        beta1_power.shape().DebugString()));
+    OP_REQUIRES(ctx, TensorShapeUtils::IsScalar(beta2_power.shape()),
+                errors::InvalidArgument("beta2_power is not a scalar: ",
+                                        beta2_power.shape().DebugString()));
+    OP_REQUIRES(ctx, TensorShapeUtils::IsScalar(lr.shape()),
+                errors::InvalidArgument("lr is not a scalar : ",
+                                        lr.shape().DebugString()));
+    OP_REQUIRES(ctx, TensorShapeUtils::IsScalar(beta1.shape()),
+                errors::InvalidArgument("beta1 is not a scalar: ",
+                                        beta1.shape().DebugString()));
+    OP_REQUIRES(ctx, TensorShapeUtils::IsScalar(beta2.shape()),
+                errors::InvalidArgument("beta2 is not a scalar: ",
+                                        beta2.shape().DebugString()));
+    OP_REQUIRES(ctx, TensorShapeUtils::IsScalar(epsilon.shape()),
+                errors::InvalidArgument("epsilon is not a scalar: ",
+                                        epsilon.shape().DebugString()));
+
+    const Tensor& grad = ctx->input(9);
+    OP_REQUIRES(ctx, var.shape().IsSameSize(m.shape()),
+                errors::InvalidArgument("var and m do not have the same shape",
+                                        var.shape().DebugString(), " ",
+                                        m.shape().DebugString()));
+    OP_REQUIRES(ctx, var.shape().IsSameSize(v.shape()),
+                errors::InvalidArgument("var and v do not have the same shape",
+                                        var.shape().DebugString(), " ",
+                                        v.shape().DebugString()));
+    OP_REQUIRES(
+        ctx, var.shape().IsSameSize(grad.shape()),
+        errors::InvalidArgument("var and grad do not have the same shape",
+                                var.shape().DebugString(), " ",
+                                grad.shape().DebugString()));
+    
+    #if GOOGLE_CUDA
+    if(IsGPUDevice<Device>()){
+      auto* stream = ctx->op_device_context()->stream();
+      
+      AllocatorAttributes alloc_attrs;
+      alloc_attrs.set_gpu_compatible(true);
+      alloc_attrs.set_nic_compatible(true);
+      alloc_attrs.set_on_host(false);
+      OP_REQUIRES_OK(ctx, ctx->allocate_output(0, var.shape(), &new_var, alloc_attrs));
+      OP_REQUIRES_OK(ctx, ctx->allocate_output(1, m.shape(), &new_m, alloc_attrs));
+      OP_REQUIRES_OK(ctx, ctx->allocate_output(2, v.shape(), &new_v, alloc_attrs));
+      cudaMemcpy((void*)new_var->flat<T>().data(), (void*)var.flat<T>().data(), num_elements * sizeof(T), cudaMemcpyDefault);
+      cudaMemcpy((void*)new_m->flat<T>().data(), (void*)m.flat<T>().data(), num_elements * sizeof(T), cudaMemcpyDefault);
+      cudaMemcpy((void*)new_v->flat<T>().data(), (void*)v.flat<T>().data(), num_elements * sizeof(T), cudaMemcpyDefault);
+      //cudaStreamSynchronize(stream);
+    }else
+    #endif
+    {
+  	  OP_REQUIRES_OK(ctx, ctx->allocate_output(0, var.shape(), &new_var));
+      OP_REQUIRES_OK(ctx, ctx->allocate_output(1, m.shape(), &new_m));
+      OP_REQUIRES_OK(ctx, ctx->allocate_output(2, v.shape(), &new_v));
+      std::copy_n(var.flat<T>().data(), num_elements , new_var->flat<T>().data());
+      std::copy_n(m.flat<T>().data(), num_elements , new_m->flat<T>().data());
+      std::copy_n(v.flat<T>().data(), num_elements , new_v->flat<T>().data());
+    }
+        
+    const Device& device = ctx->template eigen_device<Device>();
+    functor::ApplyAdam<Device, T>()(
+        device, new_var->flat<T>(), new_m->flat<T>(), new_v->flat<T>(),
+        beta1_power.scalar<T>(), beta2_power.scalar<T>(), lr.scalar<T>(),
+        beta1.scalar<T>(), beta2.scalar<T>(), epsilon.scalar<T>(),
+        grad.flat<T>(), use_nesterov_);
+
+    //MaybeForwardRefInputToRefOutput(ctx, 0, 0);
+  }
+
+ private:
+  bool use_exclusive_lock_;
+  bool use_nesterov_;
+  #if GOOGLE_CUDA
+  cudaStream_t stream;
+  #endif
+};
+
 #ifdef TENSORFLOW_USE_SYCL
 template <typename T>
 class ApplyAdamOp<SYCLDevice, T> : public OpKernel {
@@ -3367,6 +3752,9 @@ class ApplyAdamOp<SYCLDevice, T> : public OpKernel {
   REGISTER_KERNEL_BUILDER(                                         \
       Name("ApplyAdam").Device(DEVICE_##D).TypeConstraint<T>("T"), \
       ApplyAdamOp<D##Device, T>);                                  \
+  REGISTER_KERNEL_BUILDER(                                         \
+      Name("ApplyAdamHash").Device(DEVICE_##D).TypeConstraint<T>("T"), \
+      ApplyAdamHashOp<D##Device, T>);                                  \
   REGISTER_KERNEL_BUILDER(Name("ResourceApplyAdam")                \
                               .HostMemory("var")                   \
                               .HostMemory("m")                     \
