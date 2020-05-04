@@ -144,7 +144,39 @@ class FtrlOptimizer(optimizer.Optimizer):
     self._learning_rate_power_tensor = ops.convert_to_tensor(
         self._learning_rate_power, name="learning_rate_power")
 
-  def _apply_dense(self, grad, var, accum=None, linear=None):
+  def _apply_dense(self, grad, var):
+    accum = self.get_slot(var, "accum")
+    linear = self.get_slot(var, "linear")
+    if self._l2_shrinkage_regularization_strength <= 0.0:
+      return training_ops.apply_ftrl(
+          var,
+          accum,
+          linear,
+          grad,
+          math_ops.cast(self._learning_rate_tensor, var.dtype.base_dtype),
+          math_ops.cast(self._l1_regularization_strength_tensor,
+                        var.dtype.base_dtype),
+          math_ops.cast(self._l2_regularization_strength_tensor,
+                        var.dtype.base_dtype),
+          math_ops.cast(self._learning_rate_power_tensor, var.dtype.base_dtype),
+          use_locking=self._use_locking)
+    else:
+      return training_ops.apply_ftrl_v2(
+          var,
+          accum,
+          linear,
+          grad,
+          math_ops.cast(self._learning_rate_tensor, var.dtype.base_dtype),
+          math_ops.cast(self._l1_regularization_strength_tensor,
+                        var.dtype.base_dtype),
+          math_ops.cast(self._l2_regularization_strength_tensor,
+                        var.dtype.base_dtype),
+          math_ops.cast(self._l2_shrinkage_regularization_strength_tensor,
+                        var.dtype.base_dtype),
+          math_ops.cast(self._learning_rate_power_tensor, var.dtype.base_dtype),
+          use_locking=self._use_locking)
+
+  def _apply_dense_hash(self, grad, var, accum=None, linear=None):
     accum = accum if accum is not None else self.get_slot(var, "accum")
     linear = linear if linear is not None else self.get_slot(var, "linear")
     if self._l2_shrinkage_regularization_strength <= 0.0:
@@ -208,16 +240,16 @@ class FtrlOptimizer(optimizer.Optimizer):
           math_ops.cast(self._learning_rate_power_tensor, var.dtype.base_dtype),
           use_locking=self._use_locking)
 
-  def _apply_sparse(self, grad_values, grad_indices, var, accum=None, linear=None):
-    accum = accum if accum is not None else self.get_slot(var, "accum")
-    linear = linear if linear is not None else self.get_slot(var, "linear")
+  def _apply_sparse(self, grad, var):
+    accum = self.get_slot(var, "accum")
+    linear = self.get_slot(var, "linear")
     if self._l2_shrinkage_regularization_strength <= 0.0:
       return training_ops.sparse_apply_ftrl(
           var,
           accum,
           linear,
-          grad_values,
-          grad_indices,
+          grad.values,
+          grad.indices,
           math_ops.cast(self._learning_rate_tensor, var.dtype.base_dtype),
           math_ops.cast(self._l1_regularization_strength_tensor,
                         var.dtype.base_dtype),
@@ -230,8 +262,8 @@ class FtrlOptimizer(optimizer.Optimizer):
           var,
           accum,
           linear,
-          grad_values,
-          grad_indices,
+          grad.values,
+          grad.indices,
           math_ops.cast(self._learning_rate_tensor, var.dtype.base_dtype),
           math_ops.cast(self._l1_regularization_strength_tensor,
                         var.dtype.base_dtype),
