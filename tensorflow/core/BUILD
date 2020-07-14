@@ -355,6 +355,7 @@ cc_library(
     hdrs = [
         "//tensorflow/core/lib/bfloat16:bfloat16.h",
         "//tensorflow/core/lib/core:legacy_lib_core_headers",
+        "//tensorflow/core/lib/cuckoo:cuckoohash_all_headers",
         "//tensorflow/core/lib/gtl:legacy_lib_gtl_headers",
         "//tensorflow/core/lib/hash:legacy_lib_hash_all_headers",
         "//tensorflow/core/lib/histogram:legacy_lib_histogram_all_headers",

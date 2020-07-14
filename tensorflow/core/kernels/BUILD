@@ -2738,7 +2738,8 @@ tf_kernel_library(
 
 tf_kernel_library(
     name = "lookup_table_op",
-    prefix = "lookup_table_op",
+    copts = ["-fexceptions"],
+    features = ["-use_header_modules"],
     deps = LOOKUP_DEPS,
 )
 
