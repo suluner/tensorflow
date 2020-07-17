@@ -2154,21 +2154,6 @@ class TrainableWrapper(ResourceVariable):
       _result = self._clip(_result, self.ids, self.max_norm)
     return _result
 
-  def gather_nd(self, indices, name=None):
-    """Reads the value of this variable sparsely, using `gather_nd`."""
-    assert False, "TrainableWrapper.gather_nd should not be called!"
-    with ops.name_scope("GatherNd" if name is None else name) as name:
-      if self.trainable:
-        variable_accessed(self)
-      with ops.control_dependencies([
-        gen_resource_variable_ops.assign_variable_op(
-          self._handle, self.prefetch_values, name="AssignBeforeGatherNd")]):
-        _value = gen_resource_variable_ops.resource_gather_nd(
-          self._handle, indices, dtype=self._dtype, name=name)
-        value = self.transform(_value)
-
-    return array_ops.identity(value)
-
 
 class UninitializedVariable(BaseResourceVariable):
   """A variable with no initializer."""
